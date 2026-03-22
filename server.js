@@ -160,52 +160,35 @@ async function scrapeABC() {
 }
 
 // ---------------------------------------------------------------------------
-// CNN
+// Reuters
 // ---------------------------------------------------------------------------
-async function scrapeCNN() {
+async function scrapeReuters() {
   const articles = [];
 
-  // Strategy 1: CNN Arc Publishing API
+  // Strategy 1: Reuters RSS (very reliable, includes images)
   try {
-    const data  = await getJSON(
-      'https://www.cnn.com/data/ocs/section/index.html:homepage1-zone-1/views/zones/common/zone/t1/index.json',
-      { headers: { Referer: 'https://www.cnn.com/' } }
-    );
-    const items = data?.zoneContents || data?.contentElements || [];
-    items.forEach(item => {
-      const headline = item?.headline?.basic || item?.headlines?.basic || item?.label?.text || item?.title;
-      const url      = item?.canonical_url   || item?.url;
-      const image    =
-        item?.promo_items?.basic?.url                  ||
-        item?.promo_items?.lead_art?.url               ||
-        item?.promo_items?.basic?.resized_urls?.medium ||
-        null;
-      if (headline && url) {
-        const a = makeArticle(
-          headline,
-          url.startsWith('http') ? url : `https://www.cnn.com${url}`,
-          'CNN',
-          item?.description?.basic || '',
-          item?.first_publish_date || null,
-          image
-        );
-        if (a) articles.push(a);
-      }
+    const rssP = new Parser({ timeout: 10000, headers: { 'User-Agent': UA[0] },
+      customFields: { item: [['media:content','media:content',{keepArray:false}],['media:thumbnail','media:thumbnail',{keepArray:false}]] } });
+    const feed = await rssP.parseURL('https://feeds.reuters.com/reuters/topNews');
+    feed.items.slice(0, 15).forEach(item => {
+      const a = makeArticle(item.title, item.link, 'Reuters', item.contentSnippet, item.pubDate, rssImage(item));
+      if (a) articles.push(a);
     });
   } catch (_) {}
 
-  // Strategy 2: CNN search API
+  // Strategy 2: Reuters website API
   if (articles.length < 5) {
     try {
       const data = await getJSON(
-        'https://search.api.cnn.io/content?q=news&size=20&from=0&sort=newest',
-        { headers: { Referer: 'https://www.cnn.com/' } }
+        'https://www.reuters.com/pf/api/v3/content/fetch/articles-by-section-alias-or-id-v1?query=%7B%22section_id%22%3A%22%2F%22%2C%22size%22%3A20%7D&d=152&_website=reuters',
+        { headers: { Referer: 'https://www.reuters.com/' } }
       );
-      (data?.result || []).forEach(item => {
+      (data?.result?.articles || []).forEach(item => {
+        const image = item?.thumbnail?.renditions?.original?.url || null;
         const a = makeArticle(
-          item.headline, item.url, 'CNN',
-          '', item.firstPublishDate,
-          item.thumbnail || item.image || null
+          item.title || item.headline,
+          item.canonical_url ? `https://www.reuters.com${item.canonical_url}` : item.url,
+          'Reuters', item.description || '', item.published_time || null, image
         );
         if (a) articles.push(a);
       });
@@ -215,13 +198,70 @@ async function scrapeCNN() {
   // Strategy 3: scrape front page
   if (articles.length < 5) {
     try {
-      const html = await getHTML('https://www.cnn.com');
+      const html = await getHTML('https://www.reuters.com');
       const $    = cheerio.load(html);
       $('a[href]').each((_, el) => {
         const href  = $(el).attr('href') || '';
         const title = $(el).text().trim();
-        if (title.length > 25 && /^\/\d{4}\/\d{2}\/\d{2}\//.test(href)) {
-          const a = makeArticle(title, `https://www.cnn.com${href}`, 'CNN');
+        if (title.length > 20 && /^\/[a-z\-\/]+\/\d{4}-\d{2}-\d{2}\//.test(href)) {
+          const a = makeArticle(title, `https://www.reuters.com${href}`, 'Reuters');
+          if (a) articles.push(a);
+        }
+      });
+    } catch (_) {}
+  }
+
+  return dedup(articles).slice(0, 15);
+}
+
+// ---------------------------------------------------------------------------
+// Australian Financial Review (AFR)
+// AFR is paywalled but headline teasers are publicly visible
+// ---------------------------------------------------------------------------
+async function scrapeAFR() {
+  const articles = [];
+
+  // Strategy 1: AFR RSS feed
+  try {
+    const rssP = new Parser({ timeout: 10000, headers: { 'User-Agent': UA[0] },
+      customFields: { item: [['media:content','media:content',{keepArray:false}],['media:thumbnail','media:thumbnail',{keepArray:false}]] } });
+    const feed = await rssP.parseURL('https://www.afr.com/rss');
+    feed.items.slice(0, 15).forEach(item => {
+      const a = makeArticle(item.title, item.link, 'AFR', item.contentSnippet, item.pubDate, rssImage(item));
+      if (a) articles.push(a);
+    });
+  } catch (_) {}
+
+  // Strategy 2: scrape AFR front page for teasers
+  if (articles.length < 5) {
+    try {
+      const html = await getHTML('https://www.afr.com');
+      const $    = cheerio.load(html);
+      $('article, [class*="story"], [class*="Card"], [class*="article"]').each((_, el) => {
+        const a_el  = $(el).find('a[href]').first();
+        const href  = a_el.attr('href') || '';
+        const title = $(el).find('h2,h3,[class*="title"],[class*="headline"]').first().text().trim() || a_el.text().trim();
+        const img   = $(el).find('img').first().attr('src') || $(el).find('img').first().attr('data-src') || null;
+        if (title.length > 15 && href && !href.includes('/subscribe') && !href.includes('/login')) {
+          const full = href.startsWith('http') ? href : `https://www.afr.com${href}`;
+          const a = makeArticle(title, full, 'AFR', '', null, img);
+          if (a) articles.push(a);
+        }
+      });
+    } catch (_) {}
+  }
+
+  // Strategy 3: generic link scrape
+  if (articles.length < 5) {
+    try {
+      const html = await getHTML('https://www.afr.com');
+      const $    = cheerio.load(html);
+      $('a[href]').each((_, el) => {
+        const href  = $(el).attr('href') || '';
+        const title = $(el).text().trim();
+        if (title.length > 20 && /afr\.com\/[a-z]/.test(href) && !href.includes('subscribe') && !href.includes('login')) {
+          const full = href.startsWith('http') ? href : `https://www.afr.com${href}`;
+          const a = makeArticle(title, full, 'AFR');
           if (a) articles.push(a);
         }
       });
@@ -418,7 +458,7 @@ async function fetchRSSCategory(cat) {
 // ---------------------------------------------------------------------------
 // Dispatch + cache
 // ---------------------------------------------------------------------------
-const SCRAPERS = { abc: scrapeABC, cnn: scrapeCNN, aljazeera: scrapeAlJazeera, nzherald: scrapeNZHerald };
+const SCRAPERS = { abc: scrapeABC, reuters: scrapeReuters, aljazeera: scrapeAlJazeera, nzherald: scrapeNZHerald, afr: scrapeAFR };
 const ALL_CATEGORIES = [...Object.keys(SCRAPERS), ...Object.keys(RSS_FEEDS)];
 
 const cache = {};
@@ -441,16 +481,33 @@ async function getArticles(category) {
 // ---------------------------------------------------------------------------
 // BOM Weather proxy
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// BOM Weather proxy — with Open-Meteo fallback for desc/min/max
+// BOM JSON field names: air_temp, apparent_t, rel_hum, wind_spd_kmh,
+//   weather (desc), maximum_air_temp, minimum_air_temp
+// ---------------------------------------------------------------------------
 const BOM_STATIONS = [
-  { city: 'Sydney',    url: 'http://www.bom.gov.au/fwo/IDN60901/IDN60901.94768.json' },
-  { city: 'Melbourne', url: 'http://www.bom.gov.au/fwo/IDV60901/IDV60901.95936.json' },
-  { city: 'Brisbane',  url: 'http://www.bom.gov.au/fwo/IDQ60901/IDQ60901.94576.json' },
-  { city: 'Perth',     url: 'http://www.bom.gov.au/fwo/IDW60901/IDW60901.94608.json' },
-  { city: 'Adelaide',  url: 'http://www.bom.gov.au/fwo/IDS60901/IDS60901.94675.json' },
-  { city: 'Darwin',    url: 'http://www.bom.gov.au/fwo/IDD60901/IDD60901.94120.json' },
-  { city: 'Hobart',    url: 'http://www.bom.gov.au/fwo/IDT60901/IDT60901.94970.json' },
-  { city: 'Alice Sp.', url: 'http://www.bom.gov.au/fwo/IDD60901/IDD60901.94240.json' },
+  { city: 'Sydney',    url: 'http://www.bom.gov.au/fwo/IDN60901/IDN60901.94768.json', lat: -33.87, lon: 151.21 },
+  { city: 'Melbourne', url: 'http://www.bom.gov.au/fwo/IDV60901/IDV60901.95936.json', lat: -37.81, lon: 144.96 },
+  { city: 'Brisbane',  url: 'http://www.bom.gov.au/fwo/IDQ60901/IDQ60901.94576.json', lat: -27.47, lon: 153.03 },
+  { city: 'Perth',     url: 'http://www.bom.gov.au/fwo/IDW60901/IDW60901.94608.json', lat: -31.95, lon: 115.86 },
+  { city: 'Adelaide',  url: 'http://www.bom.gov.au/fwo/IDS60901/IDS60901.94675.json', lat: -34.93, lon: 138.60 },
+  { city: 'Darwin',    url: 'http://www.bom.gov.au/fwo/IDD60901/IDD60901.94120.json', lat: -12.46, lon: 130.84 },
+  { city: 'Hobart',    url: 'http://www.bom.gov.au/fwo/IDT60901/IDT60901.94970.json', lat: -42.88, lon: 147.33 },
+  { city: 'Alice Sp.', url: 'http://www.bom.gov.au/fwo/IDD60901/IDD60901.94240.json', lat: -23.70, lon: 133.88 },
 ];
+
+// WMO weather code → human description (Open-Meteo fallback)
+function wmoDesc(code) {
+  const m = {
+    0:'Clear sky', 1:'Mainly clear', 2:'Partly cloudy', 3:'Overcast',
+    45:'Fog', 48:'Icy fog', 51:'Light drizzle', 53:'Drizzle', 55:'Heavy drizzle',
+    61:'Light rain', 63:'Rain', 65:'Heavy rain', 71:'Light snow', 73:'Snow', 75:'Heavy snow',
+    80:'Rain showers', 81:'Rain showers', 82:'Heavy showers',
+    95:'Thunderstorm', 96:'Thunderstorm w/ hail', 99:'Thunderstorm w/ hail',
+  };
+  return m[code] || null;
+}
 
 const weatherCache = { data: null, ts: 0 };
 const WEATHER_TTL  = 10 * 60 * 1000;
@@ -458,59 +515,177 @@ const WEATHER_TTL  = 10 * 60 * 1000;
 app.get('/api/weather', async (req, res) => {
   const now = Date.now();
   if (weatherCache.data && now - weatherCache.ts < WEATHER_TTL) return res.json(weatherCache.data);
-  const results = await Promise.all(BOM_STATIONS.map(async s => {
-    try {
-      const r   = await fetch(s.url, {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'http://www.bom.gov.au/' },
-        signal: AbortSignal.timeout(8000),
-      });
-      const d   = await r.json();
-      const obs = d?.observations?.data?.[0];
-      return {
-        city:     s.city,
-        temp:     obs?.air_temp      ?? null,
-        feels:    obs?.apparent_t    ?? null,
-        humidity: obs?.rel_hum       ?? null,
-        wind:     obs?.wind_spd_kmh  ?? null,
-        desc:     obs?.weather       ?? null,
-        max:      obs?.max_air_temp  ?? null,
-        min:      obs?.min_air_temp  ?? null,
-      };
-    } catch (e) {
-      console.warn(`  BOM fail [${s.city}]: ${e.message}`);
-      return { city: s.city, temp: null, feels: null, humidity: null, wind: null, desc: null, max: null, min: null };
-    }
-  }));
+
+  // Fetch BOM + Open-Meteo in parallel
+  const [bomResults, omData] = await Promise.all([
+    // BOM observations
+    Promise.all(BOM_STATIONS.map(async s => {
+      try {
+        const r   = await fetch(s.url, {
+          headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'http://www.bom.gov.au/' },
+          signal: AbortSignal.timeout(8000),
+        });
+        const d   = await r.json();
+        // BOM returns newest reading first in data array
+        const obs = d?.observations?.data?.[0];
+        return {
+          city:     s.city,
+          temp:     obs?.air_temp             ?? null,
+          feels:    obs?.apparent_t           ?? null,
+          humidity: obs?.rel_hum              ?? null,
+          wind:     obs?.wind_spd_kmh         ?? null,
+          // BOM description field is 'weather' — may be null if station doesn't report it
+          desc:     obs?.weather              ?? null,
+          // Correct BOM field names for daily min/max
+          max:      obs?.maximum_air_temp     ?? null,
+          min:      obs?.minimum_air_temp     ?? null,
+        };
+      } catch (e) {
+        console.warn(`  BOM fail [${s.city}]: ${e.message}`);
+        return { city: s.city, temp: null, feels: null, humidity: null, wind: null, desc: null, max: null, min: null };
+      }
+    })),
+    // Open-Meteo fallback — gets today's min/max forecast + weather code for description
+    (async () => {
+      try {
+        const lats = BOM_STATIONS.map(s => s.lat).join(',');
+        const lons = BOM_STATIONS.map(s => s.lon).join(',');
+        const url  = `https://api.open-meteo.com/v1/forecast?latitude=${lats}&longitude=${lons}&daily=temperature_2m_max,temperature_2m_min,weathercode&current_weather=true&timezone=auto&forecast_days=1`;
+        const r    = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        return await r.json();
+      } catch { return null; }
+    })(),
+  ]);
+
+  // Merge BOM data with Open-Meteo fallbacks
+  const omArr = Array.isArray(omData) ? omData : (omData ? [omData] : []);
+  const results = bomResults.map((b, i) => {
+    const om = omArr[i];
+    return {
+      city:     b.city,
+      temp:     b.temp,
+      feels:    b.feels,
+      humidity: b.humidity,
+      wind:     b.wind,
+      // Use BOM description if available, else derive from Open-Meteo weather code
+      desc:     b.desc || wmoDesc(om?.current_weather?.weathercode) || null,
+      // Use BOM min/max if available, else Open-Meteo daily forecast
+      max:      b.max  ?? (om?.daily?.temperature_2m_max?.[0] ?? null),
+      min:      b.min  ?? (om?.daily?.temperature_2m_min?.[0] ?? null),
+    };
+  });
+
   weatherCache.data = results;
   weatherCache.ts   = now;
   res.json(results);
 });
 
 // ---------------------------------------------------------------------------
-// Yahoo Finance stocks proxy
+// Stock market data — Yahoo Finance v8 with Stooq CSV fallback
 // ---------------------------------------------------------------------------
+const STOCK_SYMBOLS = {
+  '^DJI':  { label: 'Dow Jones',  stooq: '%5EDJI'  },
+  '^AXJO': { label: 'ASX 200',    stooq: '%5EAXJO' },
+  '^NZ50': { label: 'NZX 50',     stooq: '%5ENZ50' },
+  '^HSI':  { label: 'Hang Seng',  stooq: '%5EHSI'  },
+  '^FTSE': { label: 'FTSE 100',   stooq: '%5EFTSE' },
+  '^IXIC': { label: 'NASDAQ',     stooq: '%5EIXIC' },
+};
+
 const stockCache = { data: null, ts: 0 };
 const STOCK_TTL  = 5 * 60 * 1000;
+
+async function fetchYahoo(symbols) {
+  const url = `https://query2.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(symbols.join(','))}&range=1d&interval=5m`;
+  const r   = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': 'application/json',
+      'Referer': 'https://finance.yahoo.com/',
+      'Origin':  'https://finance.yahoo.com',
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!r.ok) throw new Error(`Yahoo HTTP ${r.status}`);
+  const data = await r.json();
+
+  // v8 spark returns: { spark: { result: [ { symbol, response: [{ meta }] } ] } }
+  const results = data?.spark?.result || [];
+  return results.map(item => {
+    const meta   = item?.response?.[0]?.meta || {};
+    const prices = item?.response?.[0]?.indicators?.quote?.[0]?.close || [];
+    const prev   = meta.chartPreviousClose || meta.previousClose || null;
+    const curr   = meta.regularMarketPrice || (prices.length ? prices[prices.length - 1] : null);
+    const change = (curr && prev) ? curr - prev : null;
+    const changePct = (change && prev) ? (change / prev) * 100 : null;
+    return {
+      symbol: item.symbol,
+      regularMarketPrice: curr,
+      regularMarketChange: change,
+      regularMarketChangePercent: changePct,
+    };
+  }).filter(q => q.regularMarketPrice);
+}
+
+async function fetchStooqFallback(symbols) {
+  // Stooq returns CSV: Date,Open,High,Low,Close,Volume — fetch one by one
+  const results = await Promise.all(symbols.map(async sym => {
+    try {
+      const stooqSym = STOCK_SYMBOLS[sym]?.stooq || encodeURIComponent(sym);
+      const r = await fetch(`https://stooq.com/q/l/?s=${stooqSym}&f=sd2t2ohlcv&h&e=csv`, {
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(8000),
+      });
+      const text = await r.text();
+      const lines = text.trim().split('\n');
+      if (lines.length < 2) return null;
+      const cols  = lines[1].split(',');
+      const close = parseFloat(cols[4]);
+      const open  = parseFloat(cols[2]);
+      if (isNaN(close)) return null;
+      const change    = close - open;
+      const changePct = (change / open) * 100;
+      return { symbol: sym, regularMarketPrice: close, regularMarketChange: change, regularMarketChangePercent: changePct };
+    } catch { return null; }
+  }));
+  return results.filter(Boolean);
+}
 
 app.get('/api/stocks', async (req, res) => {
   const now = Date.now();
   if (stockCache.data && now - stockCache.ts < STOCK_TTL) return res.json(stockCache.data);
-  const symbols = ['^DJI', '^AXJO', '^NZ50', '^HSI', '^FTSE', '^IXIC'];
-  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols.join(','))}&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent,shortName`;
+
+  const symbols = Object.keys(STOCK_SYMBOLS);
+  let quotes = [];
+
+  // Try Yahoo first
   try {
-    const r    = await fetch(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json', 'Referer': 'https://finance.yahoo.com' },
-      signal: AbortSignal.timeout(8000),
-    });
-    const data   = await r.json();
-    const quotes = data?.quoteResponse?.result || [];
-    stockCache.data = quotes;
-    stockCache.ts   = now;
-    res.json(quotes);
+    quotes = await fetchYahoo(symbols);
+    console.log(`  Stocks: Yahoo returned ${quotes.length} quotes`);
   } catch (err) {
-    console.error(`  Stocks fail: ${err.message}`);
-    res.status(502).json({ error: 'Failed to fetch stocks' });
+    console.warn(`  Yahoo fail: ${err.message} — trying Stooq fallback`);
   }
+
+  // If Yahoo returned fewer than expected, fill missing from Stooq
+  if (quotes.length < symbols.length) {
+    const have    = new Set(quotes.map(q => q.symbol));
+    const missing = symbols.filter(s => !have.has(s));
+    try {
+      const fallback = await fetchStooqFallback(missing);
+      quotes = [...quotes, ...fallback];
+      console.log(`  Stocks: Stooq filled ${fallback.length} missing quotes`);
+    } catch (err) {
+      console.warn(`  Stooq fail: ${err.message}`);
+    }
+  }
+
+  if (quotes.length === 0) {
+    return res.status(502).json({ error: 'All stock sources failed' });
+  }
+
+  stockCache.data = quotes;
+  stockCache.ts   = now;
+  res.json(quotes);
 });
 
 // ---------------------------------------------------------------------------
