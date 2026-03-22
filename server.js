@@ -1,4 +1,4 @@
-'const express  = require('express');
+const express  = require('express');
 const cors     = require('cors');
 const cheerio  = require('cheerio');
 const Parser   = require('rss-parser');
@@ -595,18 +595,20 @@ const STOCK_SYMBOLS = {
 
 // Commodity & precious metal futures — Yahoo Finance symbols
 // Note: these MUST use v7 quote API (v8 spark doesn't support futures)
-const COMMODITY_SYMBOLS = {
-  'GC=F':    { label: 'Gold',        unit: 'oz'    },
-  'SI=F':    { label: 'Silver',      unit: 'oz'    },
-  'CL=F':    { label: 'Crude Oil',   unit: 'bbl'   },
-  'NG=F':    { label: 'Nat. Gas',    unit: 'MMBtu' },
-  'HG=F':    { label: 'Copper',      unit: 'lb'    },
-  'PL=F':    { label: 'Platinum',    unit: 'oz'    },
-  'PA=F':    { label: 'Palladium',   unit: 'oz'    },
-  'ZW=F':    { label: 'Wheat',       unit: 'bu'    },
-  'ZC=F':    { label: 'Corn',        unit: 'bu'    },
-  'BTC-USD': { label: 'Bitcoin',     unit: 'USD'   },
-};
+// Commodity definitions — Stooq symbol, display label, unit
+// Stooq format: futures use .f suffix (gc.f = Gold futures)
+const COMMODITIES = [
+  { stooq: 'gc.f',      yahoo: 'GC=F',     label: 'Gold',       unit: 'oz'    },
+  { stooq: 'si.f',      yahoo: 'SI=F',     label: 'Silver',     unit: 'oz'    },
+  { stooq: 'cl.f',      yahoo: 'CL=F',     label: 'Crude Oil',  unit: 'bbl'   },
+  { stooq: 'ng.f',      yahoo: 'NG=F',     label: 'Nat. Gas',   unit: 'MMBtu' },
+  { stooq: 'hg.f',      yahoo: 'HG=F',     label: 'Copper',     unit: 'lb'    },
+  { stooq: 'pl.f',      yahoo: 'PL=F',     label: 'Platinum',   unit: 'oz'    },
+  { stooq: 'pa.f',      yahoo: 'PA=F',     label: 'Palladium',  unit: 'oz'    },
+  { stooq: 'zw.f',      yahoo: 'ZW=F',     label: 'Wheat',      unit: 'bu'    },
+  { stooq: 'zc.f',      yahoo: 'ZC=F',     label: 'Corn',       unit: 'bu'    },
+  { stooq: 'btcusd',    yahoo: 'BTC-USD',  label: 'Bitcoin',    unit: 'USD'   },
+];
 
 const stockCache = { data: null, ts: 0 };
 const STOCK_TTL  = 5 * 60 * 1000;
@@ -729,6 +731,120 @@ app.get('/api/stocks', async (req, res) => {
 // ---------------------------------------------------------------------------
 const commodityCache = { data: null, ts: 0 };
 const COMMODITY_TTL  = 5 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Commodity data — Stooq CSV primary, Yahoo v7 fallback
+// Stooq is the most reliable free source for futures: no auth, no rate limits
+// ---------------------------------------------------------------------------
+async function fetchOneStooq(commodity) {
+  const url = `https://stooq.com/q/l/?s=${commodity.stooq}&f=sd2t2ohlcv&h&e=csv`;
+  const r = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!r.ok) throw new Error(`Stooq HTTP ${r.status}`);
+  const text = await r.text();
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) throw new Error('No CSV data');
+  const cols  = lines[1].split(',');
+  const close = parseFloat(cols[4]);
+  const open  = parseFloat(cols[2]);
+  if (isNaN(close) || close === 0) throw new Error(`Bad price: ${cols[4]}`);
+  const change    = close - open;
+  const changePct = open !== 0 ? (change / open) * 100 : 0;
+  return {
+    symbol:                      commodity.yahoo,
+    label:                       commodity.label,
+    unit:                        commodity.unit,
+    regularMarketPrice:          close,
+    regularMarketChange:         change,
+    regularMarketChangePercent:  changePct,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// News routes
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Commodities proxy
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Commodity data — Stooq CSV primary, Yahoo v7 fallback
+// Stooq is the most reliable free source for futures: no auth, no rate limits
+// ---------------------------------------------------------------------------
+async function fetchOneStooq(commodity) {
+  const url = `https://stooq.com/q/l/?s=${commodity.stooq}&f=sd2t2ohlcv&h&e=csv`;
+  const r = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!r.ok) throw new Error(`Stooq HTTP ${r.status}`);
+  const text = await r.text();
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) throw new Error('No CSV data');
+  const cols  = lines[1].split(',');
+  const close = parseFloat(cols[4]);
+  const open  = parseFloat(cols[2]);
+  if (isNaN(close) || close === 0) throw new Error(`Bad price: ${cols[4]}`);
+  const change    = close - open;
+  const changePct = open !== 0 ? (change / open) * 100 : 0;
+  return {
+    symbol:                      commodity.yahoo,
+    label:                       commodity.label,
+    unit:                        commodity.unit,
+    regularMarketPrice:          close,
+    regularMarketChange:         change,
+    regularMarketChangePercent:  changePct,
+  };
+}
+
+
+app.get('/api/commodities', async (req, res) => {
+  const now = Date.now();
+  if (commodityCache.data && now - commodityCache.ts < COMMODITY_TTL) {
+    return res.json(commodityCache.data);
+  }
+
+  // Fetch all commodities in parallel from Stooq
+  const results = await Promise.allSettled(COMMODITIES.map(fetchOneStooq));
+
+  const quotes = [];
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') {
+      quotes.push(r.value);
+      console.log(`  ✓ ${COMMODITIES[i].label}: ${r.value.regularMarketPrice}`);
+    } else {
+      console.warn(`  ✗ ${COMMODITIES[i].label} (${COMMODITIES[i].stooq}): ${r.reason?.message}`);
+      // Include entry with null price so frontend can show the label with a dash
+      quotes.push({
+        symbol: COMMODITIES[i].yahoo,
+        label:  COMMODITIES[i].label,
+        unit:   COMMODITIES[i].unit,
+        regularMarketPrice:         null,
+        regularMarketChange:        null,
+        regularMarketChangePercent: null,
+      });
+    }
+  });
+
+  // Only cache if we got at least half the data
+  const valid = quotes.filter(q => q.regularMarketPrice !== null).length;
+  console.log(`  Commodities: ${valid}/${COMMODITIES.length} loaded`);
+
+  if (valid > 0) {
+    commodityCache.data = quotes;
+    commodityCache.ts   = now;
+  }
+  res.json(quotes);
+});
+
+// ---------------------------------------------------------------------------
+// News routes
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Commodities proxy
+// ---------------------------------------------------------------------------
 
 // Fetch a single symbol from Stooq CSV — works for futures like GC.F, CL.F
 async function fetchStooqSymbol(yahooSym) {
