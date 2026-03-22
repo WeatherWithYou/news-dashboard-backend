@@ -165,18 +165,40 @@ async function scrapeABC() {
 async function scrapeReuters() {
   const articles = [];
 
-  // Strategy 1: Reuters RSS (very reliable, includes images)
+  // Strategy 1: Reuters Wire API (used by their mobile app — RSS died March 2026)
   try {
-    const rssP = new Parser({ timeout: 10000, headers: { 'User-Agent': UA[0] },
-      customFields: { item: [['media:content','media:content',{keepArray:false}],['media:thumbnail','media:thumbnail',{keepArray:false}]] } });
-    const feed = await rssP.parseURL('https://feeds.reuters.com/reuters/topNews');
-    feed.items.slice(0, 15).forEach(item => {
-      const a = makeArticle(item.title, item.link, 'Reuters', item.contentSnippet, item.pubDate, rssImage(item));
+    const data = await getJSON(
+      'https://wireapi.reuters.com/v8/feed/rapp/us/tabbar/feeds/home/topnews',
+      { headers: { Referer: 'https://www.reuters.com/', Accept: 'application/json' } }
+    );
+    const items = Array.isArray(data) ? data : (data?.articles || data?.items || []);
+    items.slice(0, 15).forEach(item => {
+      const image = item?.thumbnail_resizer_url || item?.image?.url || item?.images?.[0]?.url || null;
+      const a = makeArticle(
+        item.headline || item.title,
+        item.url || item.canonical_url,
+        'Reuters',
+        item.summary || item.body_short || '',
+        item.updated_at || item.published_at || null,
+        image
+      );
       if (a) articles.push(a);
     });
   } catch (_) {}
 
-  // Strategy 2: Reuters website API
+  // Strategy 2: Google News RSS for reuters.com (always reliable)
+  if (articles.length < 5) {
+    try {
+      const rssP = new Parser({ timeout: 10000, headers: { 'User-Agent': UA[0] } });
+      const feed = await rssP.parseURL('https://news.google.com/rss/search?q=when:12h+allinurl:reuters.com&ceid=AU:en&hl=en-AU&gl=AU');
+      feed.items.slice(0, 15).forEach(item => {
+        const a = makeArticle(item.title, item.link, 'Reuters', item.contentSnippet || '', item.pubDate, null);
+        if (a) articles.push(a);
+      });
+    } catch (_) {}
+  }
+
+  // Strategy 3: Reuters Arc Publishing API
   if (articles.length < 5) {
     try {
       const data = await getJSON(
@@ -191,22 +213,6 @@ async function scrapeReuters() {
           'Reuters', item.description || '', item.published_time || null, image
         );
         if (a) articles.push(a);
-      });
-    } catch (_) {}
-  }
-
-  // Strategy 3: scrape front page
-  if (articles.length < 5) {
-    try {
-      const html = await getHTML('https://www.reuters.com');
-      const $    = cheerio.load(html);
-      $('a[href]').each((_, el) => {
-        const href  = $(el).attr('href') || '';
-        const title = $(el).text().trim();
-        if (title.length > 20 && /^\/[a-z\-\/]+\/\d{4}-\d{2}-\d{2}\//.test(href)) {
-          const a = makeArticle(title, `https://www.reuters.com${href}`, 'Reuters');
-          if (a) articles.push(a);
-        }
       });
     } catch (_) {}
   }
@@ -277,24 +283,29 @@ async function scrapeAFR() {
 async function scrapeAlJazeera() {
   const articles = [];
 
-  // Strategy 1: WordPress REST API — includes featured image
+  // Strategy 1: WordPress REST API with _embed for full featured images
   try {
     const data = await getJSON(
-      'https://www.aljazeera.com/wp-json/wp/v2/posts?per_page=20&orderby=date&order=desc&_fields=title,link,excerpt,date,jetpack_featured_media_url,_links',
+      'https://www.aljazeera.com/wp-json/wp/v2/posts?per_page=20&orderby=date&order=desc&_embed=wp:featuredmedia',
       { headers: { Referer: 'https://www.aljazeera.com/' } }
     );
     if (Array.isArray(data)) {
       data.forEach(post => {
         const title   = post.title?.rendered;
         const excerpt = post.excerpt?.rendered?.replace(/<[^>]+>/g, '');
-        const image   = post.jetpack_featured_media_url || null;
+        const media   = post._embedded?.['wp:featuredmedia']?.[0];
+        const image   = media?.media_details?.sizes?.medium_large?.source_url ||
+                        media?.media_details?.sizes?.large?.source_url ||
+                        media?.source_url ||
+                        post.jetpack_featured_media_url ||
+                        null;
         const a = makeArticle(title, post.link, 'Al Jazeera', excerpt, post.date, image);
         if (a) articles.push(a);
       });
     }
   } catch (_) {}
 
-  // Strategy 2: scrape /news/ listing
+  // Strategy 2: scrape /news/ with broad lazy-load image selectors
   if (articles.length < 5) {
     try {
       const html = await getHTML('https://www.aljazeera.com/news/');
@@ -303,9 +314,9 @@ async function scrapeAlJazeera() {
         const link  = $(el).find('a[href]').first().attr('href') || '';
         const title = $(el).find('h2,h3,h4,[class*="title"]').first().text().trim()
                    || $(el).find('a').first().text().trim();
-        const img   = $(el).find('img').first().attr('src')
-                   || $(el).find('img').first().attr('data-src')
-                   || null;
+        const imgEl = $(el).find('img').first();
+        const img   = imgEl.attr('src') || imgEl.attr('data-src') ||
+                      imgEl.attr('data-lazy-src') || imgEl.attr('data-original') || null;
         if (title.length > 15 && link) {
           const full = link.startsWith('http') ? link : `https://www.aljazeera.com${link}`;
           const a = makeArticle(title, full, 'Al Jazeera', $(el).find('p').first().text(), null, img);
@@ -323,7 +334,7 @@ async function scrapeAlJazeera() {
       $('a[href]').each((_, el) => {
         const href  = $(el).attr('href') || '';
         const title = $(el).text().trim();
-        if (title.length > 20 && /\/(news|features|opinions)\/\d{4}\//.test(href)) {
+        if (title.length > 20 && /(news|features|opinions)/.test(href) && /\/20\d{2}\//.test(href)) {
           const full = href.startsWith('http') ? href : `https://www.aljazeera.com${href}`;
           const a = makeArticle(title, full, 'Al Jazeera');
           if (a) articles.push(a);
@@ -335,9 +346,7 @@ async function scrapeAlJazeera() {
   return dedup(articles).slice(0, 15);
 }
 
-// ---------------------------------------------------------------------------
-// NZ Herald + Stuff + RNZ
-// ---------------------------------------------------------------------------
+
 async function scrapeNZHerald() {
   const articles = [];
 
@@ -350,9 +359,8 @@ async function scrapeNZHerald() {
       const href  = a_el.attr('href') || '';
       const title = $(el).find('h2,h3,[class*="title"],[class*="heading"]').first().text().trim()
                  || a_el.text().trim();
-      const img   = $(el).find('img').first().attr('src')
-                 || $(el).find('img').first().attr('data-src')
-                 || null;
+      const img   = $(el).find('img').first().attr('src') || $(el).find('img').first().attr('data-src') ||
+                    $(el).find('img').first().attr('data-lazy-src') || $(el).find('img').first().attr('data-original') || null;
       if (title.length > 15 && href && !href.includes('/account') && !href.includes('/subscribe')) {
         const full = href.startsWith('http') ? href : `https://www.nzherald.co.nz${href}`;
         const a = makeArticle(title, full, 'NZ Herald', '', null, img);
@@ -370,9 +378,8 @@ async function scrapeNZHerald() {
       const href  = a_el.attr('href') || '';
       const title = $(el).find('h2,h3,[class*="title"]').first().text().trim()
                  || a_el.text().trim();
-      const img   = $(el).find('img').first().attr('src')
-                 || $(el).find('img').first().attr('data-src')
-                 || null;
+      const img   = $(el).find('img').first().attr('src') || $(el).find('img').first().attr('data-src') ||
+                    $(el).find('img').first().attr('data-lazy-src') || $(el).find('img').first().attr('data-original') || null;
       if (title.length > 20 && /stuff\.co\.nz\/[a-z\-]+\/\d+/.test(href)) {
         const full = href.startsWith('http') ? href : `https://www.stuff.co.nz${href}`;
         const a = makeArticle(title, full, 'Stuff NZ', '', null, img);
