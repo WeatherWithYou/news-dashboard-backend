@@ -1,558 +1,549 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>The Dashboard</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Serif+Display&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+const express = require('express');
+const cors = require('cors');
+const cheerio = require('cheerio');
+const Parser = require('rss-parser');
 
-    :root {
-      --bg:        #0a0a0f;
-      --surface:   #13131a;
-      --surface2:  #1a1a24;
-      --border:    #22222e;
-      --border-hi: #32323f;
-      --text:      #e6e4f0;
-      --muted:     #6b6880;
-      --accent:    #7c6dfa;
-      --accent-lo: rgba(124,109,250,0.07);
-      --red:       #f05e6a;
-      --green:     #3ecf8e;
-      --col-abc:       #7c6dfa;
-      --col-cnn:       #f05e6a;
-      --col-aljazeera: #f0a05e;
-      --col-nzherald:  #3ecf8e;
-      --col-tech:      #5b9cf6;
-      --col-sport:     #3ecf8e;
-      --col-science:   #f0a05e;
-      --col-business:  #b06dfa;
-      --serif: 'DM Serif Display', Georgia, serif;
-      --mono:  'DM Mono', monospace;
-      --sans:  'DM Sans', system-ui, sans-serif;
+const app = express();
+const PORT = process.env.PORT || 3001;
+app.use(cors());
+app.use(express.json());
+
+// ---------------------------------------------------------------------------
+// Shared fetch helper — rotates user-agents, sets browser-like headers
+// ---------------------------------------------------------------------------
+const UA = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+  'Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0',
+];
+let uaIndex = 0;
+
+async function get(url, opts = {}) {
+  const ua = UA[uaIndex++ % UA.length];
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': ua,
+      'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+      'Accept-Language': 'en-AU,en;q=0.9',
+      'Cache-Control': 'no-cache',
+      ...opts.headers,
+    },
+    signal: AbortSignal.timeout(12000),
+    ...opts,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} — ${url}`);
+  return res;
+}
+
+async function getJSON(url, opts = {}) {
+  const res = await get(url, { headers: { Accept: 'application/json', ...opts.headers }, ...opts });
+  return res.json();
+}
+
+async function getHTML(url, opts = {}) {
+  const res = await get(url, opts);
+  return res.text();
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function clean(str) {
+  return (str || '').replace(/\s+/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#039;/g, "'").trim();
+}
+
+function dedup(articles) {
+  const seen = new Set();
+  return articles.filter(a => {
+    if (!a.title || a.title.length < 12) return false;
+    const key = a.title.slice(0, 80).toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function makeArticle(title, link, source, summary = '', published = null, image = null) {
+  if (!title || !link || link === '#') return null;
+  return { title: clean(title), link, summary: clean(summary), published, source, image };
+}
+
+// Extract image from RSS item — checks enclosure, media:content, itunes:image, og meta
+function extractRSSImage(item) {
+  return item.enclosure?.url ||
+    item['media:content']?.$.url ||
+    item['media:thumbnail']?.$.url ||
+    item.itunes?.image ||
+    null;
+}
+
+// ---------------------------------------------------------------------------
+// ABC News Australia
+// Multiple strategies in priority order.
+// ---------------------------------------------------------------------------
+async function scrapeABC() {
+  const articles = [];
+
+  // Strategy 1: ABC's internal content API (JSON, very structured)
+  try {
+    const data = await getJSON(
+      'https://www.abc.net.au/news-web/api/loader/channelrefetch?name=PaginationArticleList&documentId=13437&offset=0&size=20&total=20',
+      { headers: { Referer: 'https://www.abc.net.au/news' } }
+    );
+    const items = data?.items || data?.data?.items || [];
+    items.forEach(item => {
+      const a = makeArticle(
+        item.title || item.headline,
+        item.link ? `https://www.abc.net.au${item.link}` : item.url,
+        'ABC News AU',
+        item.synopsis || item.description,
+        item.updated || item.published
+      );
+      if (a) articles.push(a);
+    });
+  } catch (_) {}
+
+  // Strategy 2: scrape Just In listing page (chronological, no JS needed)
+  if (articles.length < 5) {
+    try {
+      const html = await getHTML('https://www.abc.net.au/news/justin');
+      const $ = cheerio.load(html);
+      $('a[href]').each((_, el) => {
+        const href  = $(el).attr('href') || '';
+        const title = $(el).text().trim();
+        if (title.length > 20 && /\/news\/\d{4}-\d{2}-\d{2}\//.test(href)) {
+          const a = makeArticle(title, `https://www.abc.net.au${href}`, 'ABC News AU');
+          if (a) articles.push(a);
+        }
+      });
+    } catch (_) {}
+  }
+
+  // Strategy 3: scrape main news page
+  if (articles.length < 5) {
+    try {
+      const html = await getHTML('https://www.abc.net.au/news');
+      const $ = cheerio.load(html);
+      $('a[href]').each((_, el) => {
+        const href  = $(el).attr('href') || '';
+        const title = $(el).text().trim();
+        if (title.length > 20 && href.includes('/news/') && href.includes('-')) {
+          const link = href.startsWith('http') ? href : `https://www.abc.net.au${href}`;
+          const a = makeArticle(title, link, 'ABC News AU');
+          if (a) articles.push(a);
+        }
+      });
+    } catch (_) {}
+  }
+
+  return dedup(articles).slice(0, 15);
+}
+
+// ---------------------------------------------------------------------------
+// CNN
+// CNN removed their public RSS. We use their content API + HTML fallback.
+// ---------------------------------------------------------------------------
+async function scrapeCNN() {
+  const articles = [];
+
+  // Strategy 1: CNN's Arc Publishing content API
+  try {
+    const data = await getJSON(
+      'https://www.cnn.com/data/ocs/section/index.html:homepage1-zone-1/views/zones/common/zone/t1/index.json',
+      { headers: { Referer: 'https://www.cnn.com/' } }
+    );
+    const zones = data?.zoneContents || data?.contentElements || [];
+    zones.forEach(item => {
+      const headline = item?.headline?.basic || item?.headlines?.basic || item?.label?.text || item?.title;
+      const url = item?.canonical_url || item?.url;
+      if (headline && url) {
+        const a = makeArticle(
+          headline,
+          url.startsWith('http') ? url : `https://www.cnn.com${url}`,
+          'CNN',
+          item?.description?.basic || '',
+          item?.first_publish_date || null
+        );
+        if (a) articles.push(a);
+      }
+    });
+  } catch (_) {}
+
+  // Strategy 2: CNN search API for latest news
+  if (articles.length < 5) {
+    try {
+      const data = await getJSON(
+        'https://search.api.cnn.io/content?q=news&size=20&from=0&page=1&sort=newest&category=us,world,politics,business',
+        { headers: { Referer: 'https://www.cnn.com/' } }
+      );
+      const hits = data?.result || [];
+      hits.forEach(item => {
+        const a = makeArticle(
+          item.headline,
+          item.url,
+          'CNN',
+          item.body?.slice(0, 200) || '',
+          item.firstPublishDate
+        );
+        if (a) articles.push(a);
+      });
+    } catch (_) {}
+  }
+
+  // Strategy 3: scrape the front page
+  if (articles.length < 5) {
+    try {
+      const html = await getHTML('https://www.cnn.com');
+      const $ = cheerio.load(html);
+      $('a[href]').each((_, el) => {
+        const href  = $(el).attr('href') || '';
+        const title = $(el).text().trim();
+        if (title.length > 25 && /^\/\d{4}\/\d{2}\/\d{2}\//.test(href)) {
+          const a = makeArticle(title, `https://www.cnn.com${href}`, 'CNN');
+          if (a) articles.push(a);
+        }
+      });
+    } catch (_) {}
+  }
+
+  return dedup(articles).slice(0, 15);
+}
+
+// ---------------------------------------------------------------------------
+// Al Jazeera
+// AJ is React/Next.js — we try their WP JSON API, then scrape /news/
+// ---------------------------------------------------------------------------
+async function scrapeAlJazeera() {
+  const articles = [];
+
+  // Strategy 1: WordPress REST API (AJ runs WP under the hood)
+  try {
+    const data = await getJSON(
+      'https://www.aljazeera.com/wp-json/wp/v2/posts?per_page=20&orderby=date&order=desc&_fields=title,link,excerpt,date,jetpack_featured_media_url',
+      { headers: { Referer: 'https://www.aljazeera.com/' } }
+    );
+    if (Array.isArray(data)) {
+      data.forEach(post => {
+        const title   = post.title?.rendered;
+        const excerpt = post.excerpt?.rendered?.replace(/<[^>]+>/g, '');
+        const image   = post.jetpack_featured_media_url || null;
+        const a = makeArticle(title, post.link, 'Al Jazeera', excerpt, post.date, image);
+        if (a) articles.push(a);
+      });
     }
+  } catch (_) {}
 
-    html { background: var(--bg); color: var(--text); font-family: var(--sans); }
-    body { min-height: 100vh; }
+  // Strategy 2: scrape /news/ listing
+  if (articles.length < 5) {
+    try {
+      const html = await getHTML('https://www.aljazeera.com/news/');
+      const $ = cheerio.load(html);
+      $('article, .article-card, [class*="article-card"], [class*="ArticleCard"]').each((_, el) => {
+        const link  = $(el).find('a[href]').first().attr('href') || '';
+        const title = $(el).find('h2, h3, h4, [class*="title"]').first().text().trim()
+                   || $(el).find('a').first().text().trim();
+        const summary = $(el).find('p').first().text().trim();
+        if (title.length > 15 && link) {
+          const full = link.startsWith('http') ? link : `https://www.aljazeera.com${link}`;
+          const a = makeArticle(title, full, 'Al Jazeera', summary);
+          if (a) articles.push(a);
+        }
+      });
+    } catch (_) {}
+  }
 
-    /* ─── Header ─── */
-    header {
-      position: sticky; top: 0; z-index: 100;
-      background: var(--bg);
-      border-bottom: 1px solid var(--border);
-      padding: 0 24px;
-      display: flex; align-items: center; justify-content: space-between; gap: 16px;
-    }
-    .header-left { display: flex; align-items: baseline; gap: 16px; padding: 14px 0; }
-    .masthead { font-family: var(--serif); font-size: 24px; color: var(--text); }
-    .masthead span { color: var(--accent); }
-    .dateline { font-family: var(--mono); font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
-    .header-right { display: flex; align-items: center; gap: 12px; }
-    .refresh-btn {
-      font-family: var(--mono); font-size: 11px; color: var(--muted);
-      background: none; border: 1px solid var(--border); border-radius: 6px;
-      padding: 6px 14px; cursor: pointer; transition: all 0.15s; letter-spacing: 0.04em;
-    }
-    .refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
-    .refresh-btn.spinning { opacity: 0.4; pointer-events: none; }
-    .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2.5s ease-in-out infinite; }
-    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+  // Strategy 3: generic anchor scrape
+  if (articles.length < 5) {
+    try {
+      const html = await getHTML('https://www.aljazeera.com');
+      const $ = cheerio.load(html);
+      $('a[href]').each((_, el) => {
+        const href  = $(el).attr('href') || '';
+        const title = $(el).text().trim();
+        if (title.length > 20 && /\/(news|features|opinions)\/\d{4}\//.test(href)) {
+          const full = href.startsWith('http') ? href : `https://www.aljazeera.com${href}`;
+          const a = makeArticle(title, full, 'Al Jazeera');
+          if (a) articles.push(a);
+        }
+      });
+    } catch (_) {}
+  }
 
-    /* ─── Widgets row ─── */
-    .widgets-row {
-      display: grid;
-      grid-template-columns: 1fr 400px;
-      border-bottom: 1px solid var(--border);
-    }
+  return dedup(articles).slice(0, 15);
+}
 
-    /* ── Stocks ── */
-    .stocks-panel { border-right: 1px solid var(--border); padding: 14px 20px 16px; display: flex; flex-direction: column; gap: 10px; }
-    .panel-label { font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); }
-    .stocks-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
-    .stock-card {
-      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
-      padding: 10px 12px; transition: border-color 0.15s;
-    }
-    .stock-card:hover { border-color: var(--border-hi); }
-    .stock-name { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .stock-price { font-family: var(--sans); font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 3px; }
-    .stock-change { font-family: var(--mono); font-size: 10px; font-weight: 500; }
-    .stock-change.up   { color: var(--green); }
-    .stock-change.down { color: var(--red); }
-    .stock-skel { height: 62px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; animation: shimmer 1.5s ease infinite; }
+// ---------------------------------------------------------------------------
+// NZ Herald + Stuff.co.nz
+// NZ Herald is heavily paywalled; we pull their free teasers then supplement
+// with Stuff.co.nz (NZ's largest fully free news site).
+// ---------------------------------------------------------------------------
+async function scrapeNZHerald() {
+  const articles = [];
 
-    /* ── Weather ── */
-    .weather-panel { padding: 14px 16px 16px; display: flex; flex-direction: column; gap: 10px; overflow: hidden; }
-    .weather-header { display: flex; align-items: center; justify-content: space-between; }
-    .weather-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 6px;
-      flex: 1;
-    }
-    .weather-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 10px 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-      transition: border-color 0.15s;
-    }
-    .weather-card:hover { border-color: var(--border-hi); }
-    .weather-city { font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 2px; }
-    .weather-temp { font-family: var(--sans); font-size: 20px; font-weight: 600; color: var(--text); line-height: 1; }
-    .weather-temp span { font-size: 12px; font-weight: 400; color: var(--muted); }
-    .weather-desc { font-family: var(--sans); font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .weather-row { display: flex; gap: 8px; margin-top: 2px; }
-    .weather-stat { font-family: var(--mono); font-size: 9px; color: var(--muted); }
-    .weather-stat b { color: var(--text); font-weight: 500; }
-    .weather-minmax { font-family: var(--mono); font-size: 9px; }
-    .weather-max { color: #e74c3c; }
-    .weather-min { color: #5b9cf6; }
-    .weather-skel { height: 88px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; animation: shimmer 1.5s ease infinite; }
+  // NZ Herald — scrape their latest news feed page
+  try {
+    const html = await getHTML('https://www.nzherald.co.nz/latest-news/');
+    const $ = cheerio.load(html);
+    // NZ Herald article links share the pattern /nz/, /world/, /business/ etc.
+    $('h2 a, h3 a, .story-card a, [class*="story"] a, [class*="article"] a').each((_, el) => {
+      const href  = $(el).attr('href') || '';
+      const title = $(el).text().trim()
+                 || $(el).closest('[class*="card"]').find('h2,h3').text().trim();
+      if (title.length > 15 && href.includes('nzherald') && !href.includes('/account')) {
+        const a = makeArticle(title, href.startsWith('http') ? href : `https://www.nzherald.co.nz${href}`, 'NZ Herald');
+        if (a) articles.push(a);
+      }
+    });
+  } catch (_) {}
 
-    /* ─── Nav ─── */
-    nav { border-bottom: 1px solid var(--border); padding: 0 24px; display: flex; overflow-x: auto; }
-    nav::-webkit-scrollbar { display: none; }
-    .nav-item {
-      font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em;
-      padding: 10px 16px; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent;
-      transition: all 0.15s; white-space: nowrap; background: none;
-      border-top: none; border-left: none; border-right: none;
-      display: flex; align-items: center; gap: 7px;
-    }
-    .nav-item:hover { color: var(--text); }
-    .nav-item.active { color: var(--text); border-bottom-color: var(--cat-color, var(--accent)); }
-    .nav-item .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--cat-color, var(--muted)); opacity: 0.6; }
-    .nav-item.active .dot { opacity: 1; background: var(--cat-color, var(--accent)); }
+  // Stuff.co.nz — always free, NZ's biggest site
+  try {
+    const html = await getHTML('https://www.stuff.co.nz');
+    const $ = cheerio.load(html);
+    $('a[href]').each((_, el) => {
+      const href  = $(el).attr('href') || '';
+      const title = $(el).text().trim();
+      if (title.length > 20 && /stuff\.co\.nz\/[a-z\-]+\/\d+/.test(href)) {
+        const a = makeArticle(title, href.startsWith('http') ? href : `https://www.stuff.co.nz${href}`, 'Stuff NZ');
+        if (a) articles.push(a);
+      }
+    });
+  } catch (_) {}
 
-    /* ─── Main grid ─── */
-    main { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); border-left: 1px solid var(--border); }
+  // RNZ (Radio New Zealand) — fully public, excellent RSS
+  try {
+    const rss = new Parser({ timeout: 10000, headers: { 'User-Agent': UA[0] } });
+    const feed = await rss.parseURL('https://www.rnz.co.nz/rss/news.xml');
+    feed.items.slice(0, 8).forEach(item => {
+      const a = makeArticle(item.title, item.link, 'RNZ', item.contentSnippet, item.pubDate);
+      if (a) articles.push(a);
+    });
+  } catch (_) {}
 
-    /* ─── Column ─── */
-    .column { border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); display: flex; flex-direction: column; animation: fadeIn 0.35s ease both; }
-    @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:none} }
-    .column-header {
-      padding: 14px 20px 12px; border-bottom: 1px solid var(--border);
-      display: flex; align-items: center; justify-content: space-between;
-      position: sticky; top: 57px; background: var(--bg); z-index: 10;
-    }
-    .column-title { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--cat-color, var(--accent)); display: flex; align-items: center; gap: 8px; }
-    .column-title::before { content: ''; display: block; width: 12px; height: 1.5px; background: var(--cat-color, var(--accent)); border-radius: 2px; }
-    .article-count { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+  return dedup(articles).slice(0, 15);
+}
 
-    /* ─── Article card ─── */
-    .article {
-      padding: 14px 20px; border-bottom: 1px solid var(--border);
-      cursor: pointer; transition: background 0.12s;
-      text-decoration: none; display: block; color: inherit;
-    }
-    .article:last-child { border-bottom: none; }
-    .article:hover { background: var(--accent-lo); }
+// ---------------------------------------------------------------------------
+// RSS-based categories (still reliable for these outlets)
+// ---------------------------------------------------------------------------
+const rssParser = new Parser({
+  timeout: 10000,
+  headers: { 'User-Agent': UA[0] },
+  customFields: {
+    item: [
+      ['media:content', 'media:content', { keepArray: false }],
+      ['media:thumbnail', 'media:thumbnail', { keepArray: false }],
+    ],
+  },
+});
 
-    /* Image + text layout */
-    .article-inner { display: flex; gap: 12px; align-items: flex-start; }
-    .article-img {
-      width: 72px; height: 52px; object-fit: cover; border-radius: 4px;
-      flex-shrink: 0; background: var(--surface); display: block;
-    }
-    .article-img-placeholder { width: 72px; height: 52px; border-radius: 4px; flex-shrink: 0; background: var(--surface); border: 1px solid var(--border); }
-    .article-body { flex: 1; min-width: 0; }
-
-    .article-meta { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; flex-wrap: wrap; }
-    .source-tag { font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--cat-color, var(--accent)); opacity: 0.8; }
-    .article-time { font-family: var(--mono); font-size: 9px; color: var(--muted); }
-
-    .article-title {
-      font-family: var(--serif); font-size: 14px; font-weight: 400;
-      line-height: 1.38; color: var(--text); margin-bottom: 5px; transition: color 0.12s;
-    }
-    .article:hover .article-title { color: var(--cat-color, var(--accent)); }
-    .article-summary {
-      font-family: var(--sans); font-size: 11px; font-weight: 300; color: var(--muted);
-      line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
-    }
-
-    /* ─── Skeletons ─── */
-    .skeleton { animation: shimmer 1.5s ease infinite; }
-    @keyframes shimmer { 0%,100%{opacity:0.3} 50%{opacity:0.65} }
-    .skel-line { height: 12px; background: var(--border); border-radius: 3px; margin-bottom: 8px; }
-    .skel-line.wide { width: 88%; } .skel-line.med { width: 62%; } .skel-line.short { width: 38%; }
-    .skel-meta { display: flex; gap: 8px; margin-bottom: 10px; }
-    .skel-tag { height: 9px; width: 55px; background: var(--border); border-radius: 3px; }
-    .skel-time { height: 9px; width: 40px; background: var(--border); border-radius: 3px; }
-    .skel-img { width: 72px; height: 52px; background: var(--border); border-radius: 4px; flex-shrink: 0; }
-
-    /* ─── Error/empty ─── */
-    .error-card { padding: 20px; font-family: var(--mono); font-size: 11px; color: var(--red); opacity: 0.7; line-height: 1.6; }
-    .empty { padding: 32px 20px; text-align: center; font-family: var(--mono); font-size: 11px; color: var(--muted); }
-
-    /* ─── Footer ─── */
-    footer { border-top: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; }
-    .footer-note { font-family: var(--mono); font-size: 10px; color: var(--muted); }
-    .footer-note a { color: var(--muted); text-decoration: none; }
-    .footer-note a:hover { color: var(--accent); }
-
-    ::-webkit-scrollbar { width: 3px; height: 3px; }
-    ::-webkit-scrollbar-thumb { background: var(--border-hi); border-radius: 2px; }
-
-    @media (max-width: 900px) {
-      .widgets-row { grid-template-columns: 1fr; }
-      .weather-panel { border-top: 1px solid var(--border); }
-      .stocks-grid { grid-template-columns: repeat(3, 1fr); }
-    }
-    @media (max-width: 600px) { .stocks-grid { grid-template-columns: repeat(2, 1fr); } }
-  </style>
-</head>
-<body>
-
-<header>
-  <div class="header-left">
-    <div class="masthead">The<span>.</span>Dashboard</div>
-    <div class="dateline" id="dateline"></div>
-  </div>
-  <div class="header-right">
-    <div class="status-dot"></div>
-    <button class="refresh-btn" id="refresh-btn" onclick="refreshAll()">↻ Refresh</button>
-  </div>
-</header>
-
-<div class="widgets-row">
-  <!-- Stocks -->
-  <div class="stocks-panel">
-    <div class="panel-label">Markets</div>
-    <div class="stocks-grid" id="stocks-grid">
-      <div class="stock-skel"></div><div class="stock-skel"></div><div class="stock-skel"></div>
-      <div class="stock-skel"></div><div class="stock-skel"></div><div class="stock-skel"></div>
-    </div>
-  </div>
-  <!-- BOM Weather city list -->
-  <div class="weather-panel">
-    <div class="weather-header">
-      <div class="panel-label">Australia — BOM live observations</div>
-      <div class="panel-label" id="weather-updated"></div>
-    </div>
-    <div class="weather-grid" id="weather-grid">
-      <div class="weather-skel"></div><div class="weather-skel"></div>
-      <div class="weather-skel"></div><div class="weather-skel"></div>
-      <div class="weather-skel"></div><div class="weather-skel"></div>
-      <div class="weather-skel"></div><div class="weather-skel"></div>
-    </div>
-  </div>
-</div>
-
-<nav id="category-nav"></nav>
-<main id="grid"></main>
-
-<footer>
-  <div class="footer-note">
-    News via <a href="https://news-dashboard-backend-production.up.railway.app/api/news" target="_blank">Railway backend</a>
-    &nbsp;·&nbsp; Weather: <a href="https://www.bom.gov.au" target="_blank">Bureau of Meteorology</a>
-    &nbsp;·&nbsp; Stocks: Yahoo Finance
-  </div>
-  <div class="footer-note" id="last-updated"></div>
-</footer>
-
-<script>
-// ═══════════════════════════════════════════════════════════════
-// CONFIG — update API_BASE if your Railway URL changes
-// ═══════════════════════════════════════════════════════════════
-const API_BASE = 'https://news-dashboard-backend-production.up.railway.app';
-
-const CATEGORY_META = {
-  abc:       { label: 'ABC News AU',  color: 'var(--col-abc)'       },
-  cnn:       { label: 'CNN',          color: 'var(--col-cnn)'        },
-  aljazeera: { label: 'Al Jazeera',   color: 'var(--col-aljazeera)'  },
-  nzherald:  { label: 'NZ News',      color: 'var(--col-nzherald)'   },
-  tech:      { label: 'Tech',         color: 'var(--col-tech)'       },
-  sport:     { label: 'Sport',        color: 'var(--col-sport)'      },
-  science:   { label: 'Science',      color: 'var(--col-science)'    },
-  business:  { label: 'Business',     color: 'var(--col-business)'   },
+const RSS_FEEDS = {
+  tech: [
+    { name: 'The Verge',    url: 'https://www.theverge.com/rss/index.xml' },
+    { name: 'Ars Technica', url: 'https://feeds.arstechnica.com/arstechnica/index' },
+    { name: 'Hacker News',  url: 'https://hnrss.org/frontpage' },
+  ],
+  sport: [
+    { name: 'BBC Sport',    url: 'https://feeds.bbci.co.uk/sport/rss.xml' },
+    { name: 'ESPN',         url: 'https://www.espn.com/espn/rss/news' },
+  ],
+  science: [
+    { name: 'New Scientist', url: 'https://www.newscientist.com/feed/home/' },
+    { name: 'Phys.org',      url: 'https://phys.org/rss-feed/breaking/' },
+    { name: 'NASA',          url: 'https://www.nasa.gov/news-release/feed/' },
+  ],
+  business: [
+    { name: 'Reuters Biz',   url: 'https://feeds.reuters.com/reuters/businessNews' },
+    { name: 'Bloomberg',     url: 'https://feeds.bloomberg.com/markets/news.rss' },
+  ],
 };
 
-const DEFAULT_VISIBLE = ['abc', 'cnn', 'aljazeera', 'nzherald'];
-const AUTO_REFRESH_MS = 5 * 60 * 1000;
+async function fetchRSSFeed(feed) {
+  try {
+    const parsed = await rssParser.parseURL(feed.url);
+    return parsed.items.slice(0, 10).map(item => ({
+      title:     clean(item.title || ''),
+      link:      item.link || item.guid || '#',
+      summary:   clean(item.contentSnippet || ''),
+      published: item.pubDate || item.isoDate || null,
+      source:    feed.name,
+      image:     extractRSSImage(item),
+    })).filter(a => a.title.length > 10);
+  } catch (err) {
+    console.warn(`  RSS fail [${feed.name}]: ${err.message}`);
+    return [];
+  }
+}
 
-const STOCK_META = {
-  '^DJI':  { label: 'Dow Jones' },
-  '^AXJO': { label: 'ASX 200'   },
-  '^NZ50': { label: 'NZX 50'    },
-  '^HSI':  { label: 'Hang Seng' },
-  '^FTSE': { label: 'FTSE 100'  },
-  '^IXIC': { label: 'NASDAQ'    },
+async function fetchRSSCategory(category) {
+  const results = await Promise.all((RSS_FEEDS[category] || []).map(fetchRSSFeed));
+  return results.flat().sort((a, b) => new Date(b.published || 0) - new Date(a.published || 0));
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch + cache
+// ---------------------------------------------------------------------------
+const SCRAPERS = {
+  abc:       scrapeABC,
+  cnn:       scrapeCNN,
+  aljazeera: scrapeAlJazeera,
+  nzherald:  scrapeNZHerald,
 };
 
-// ═══════════════════════════════════════════════════════════════
-// STATE
-// ═══════════════════════════════════════════════════════════════
-let visibleCategories = [...DEFAULT_VISIBLE];
-let articleData = {};
-let allCategories = [];
+const ALL_CATEGORIES = [...Object.keys(SCRAPERS), ...Object.keys(RSS_FEEDS)];
 
-// ═══════════════════════════════════════════════════════════════
-// INIT
-// ═══════════════════════════════════════════════════════════════
-document.addEventListener('DOMContentLoaded', async () => {
-  updateDateline();
-  setInterval(updateDateline, 30_000);
+const cache = {};
+const CACHE_TTL = 5 * 60 * 1000;
 
-  fetchStocks();
-  fetchWeather();
+async function getArticles(category) {
+  const now = Date.now();
+  if (cache[category] && now - cache[category].ts < CACHE_TTL) {
+    return cache[category].data;
+  }
+  console.log(`  → fetching [${category}]`);
+  let articles = [];
+  try {
+    articles = SCRAPERS[category]
+      ? await SCRAPERS[category]()
+      : await fetchRSSCategory(category);
+  } catch (err) {
+    console.error(`  ✗ [${category}]: ${err.message}`);
+  }
+  cache[category] = { ts: now, data: articles };
+  return articles;
+}
 
-  allCategories = await fetchCategories();
-  renderNav();
-  renderColumns();
-  fetchAllData();
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+app.get('/api/categories', (_, res) => res.json(ALL_CATEGORIES));
 
-  if (AUTO_REFRESH_MS > 0) {
-    setInterval(() => { fetchStocks(); fetchWeather(); fetchAllData(); }, AUTO_REFRESH_MS);
+app.get('/api/news/:category', async (req, res) => {
+  const { category } = req.params;
+  if (!ALL_CATEGORIES.includes(category))
+    return res.status(404).json({ error: `Unknown category: ${category}` });
+  const articles = await getArticles(category);
+  res.json({ category, articles, count: articles.length, cachedAt: cache[category]?.ts });
+});
+
+app.get('/api/news', async (_, res) => {
+  const results = await Promise.all(ALL_CATEGORIES.map(async cat => [cat, await getArticles(cat)]));
+  res.json(Object.fromEntries(results));
+});
+
+app.post('/api/cache/clear', (_, res) => {
+  Object.keys(cache).forEach(k => delete cache[k]);
+  res.json({ ok: true, message: 'Cache cleared' });
+});
+
+// Debug: force-refetch one category and return raw results
+app.get('/api/debug/:category', async (req, res) => {
+  const { category } = req.params;
+  delete cache[category];
+  const articles = await getArticles(category);
+  res.json({ category, count: articles.length, articles });
+});
+
+// ---------------------------------------------------------------------------
+// BOM Weather proxy
+// BOM's JSON feeds block browser CORS requests, so we fetch them server-side.
+// Each city maps to an official BOM observation station JSON feed.
+// ---------------------------------------------------------------------------
+const BOM_STATIONS = [
+  { city: 'Sydney',     url: 'http://www.bom.gov.au/fwo/IDN60901/IDN60901.94768.json', left: '80%', top: '66%' },
+  { city: 'Melbourne',  url: 'http://www.bom.gov.au/fwo/IDV60901/IDV60901.95936.json', left: '68%', top: '79%' },
+  { city: 'Brisbane',   url: 'http://www.bom.gov.au/fwo/IDQ60901/IDQ60901.94576.json', left: '82%', top: '53%' },
+  { city: 'Perth',      url: 'http://www.bom.gov.au/fwo/IDW60901/IDW60901.94608.json', left: '16%', top: '65%' },
+  { city: 'Adelaide',   url: 'http://www.bom.gov.au/fwo/IDS60901/IDS60901.94675.json', left: '54%', top: '74%' },
+  { city: 'Darwin',     url: 'http://www.bom.gov.au/fwo/IDD60901/IDD60901.94120.json', left: '38%', top: '12%' },
+  { city: 'Hobart',     url: 'http://www.bom.gov.au/fwo/IDT60901/IDT60901.94970.json', left: '67%', top: '91%' },
+  { city: 'Alice Sp.',  url: 'http://www.bom.gov.au/fwo/IDD60901/IDD60901.94240.json', left: '44%', top: '46%' },
+];
+
+const weatherCache = { data: null, ts: 0 };
+const WEATHER_TTL  = 10 * 60 * 1000; // 10 minutes
+
+app.get('/api/weather', async (req, res) => {
+  const now = Date.now();
+  if (weatherCache.data && now - weatherCache.ts < WEATHER_TTL) {
+    return res.json(weatherCache.data);
+  }
+
+  const results = await Promise.all(BOM_STATIONS.map(async station => {
+    try {
+      const r    = await fetch(station.url, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'http://www.bom.gov.au/' },
+        signal: AbortSignal.timeout(8000),
+      });
+      const data = await r.json();
+      // BOM JSON structure: observations.data[0] is the most recent reading
+      const obs  = data?.observations?.data?.[0];
+      return {
+        city:     station.city,
+        temp:     obs?.air_temp       ?? null,
+        feels:    obs?.apparent_t     ?? null,
+        humidity: obs?.rel_hum        ?? null,
+        wind:     obs?.wind_spd_kmh   ?? null,
+        desc:     obs?.weather        ?? null,
+        max:      obs?.max_air_temp   ?? null,
+        min:      obs?.min_air_temp   ?? null,
+        left:     station.left,
+        top:      station.top,
+      };
+    } catch (err) {
+      console.warn(`  BOM fetch failed [${station.city}]: ${err.message}`);
+      return { city: station.city, temp: null, left: station.left, top: station.top };
+    }
+  }));
+
+  weatherCache.data = results;
+  weatherCache.ts   = now;
+  res.json(results);
+});
+
+// ---------------------------------------------------------------------------
+// Yahoo Finance proxy
+// Yahoo blocks direct browser requests with CORS; proxying via the backend
+// works reliably since server-to-server requests are not blocked.
+// ---------------------------------------------------------------------------
+const stockCache = { data: null, ts: 0 };
+const STOCK_TTL  = 5 * 60 * 1000;
+
+app.get('/api/stocks', async (req, res) => {
+  const now = Date.now();
+  if (stockCache.data && now - stockCache.ts < STOCK_TTL) {
+    return res.json(stockCache.data);
+  }
+
+  const symbols = ['^DJI', '^AXJO', '^NZ50', '^HSI', '^FTSE', '^IXIC'];
+  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols.join(','))}&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent,shortName`;
+
+  try {
+    const r    = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'Accept': 'application/json',
+        'Referer': 'https://finance.yahoo.com',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await r.json();
+    const quotes = data?.quoteResponse?.result || [];
+    stockCache.data = quotes;
+    stockCache.ts   = now;
+    res.json(quotes);
+  } catch (err) {
+    console.error(`  Stocks fetch failed: ${err.message}`);
+    res.status(502).json({ error: 'Failed to fetch stock data' });
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// STOCKS — now fetched via Railway proxy
-// ═══════════════════════════════════════════════════════════════
-async function fetchStocks() {
-  try {
-    const res    = await fetch(`${API_BASE}/api/stocks`);
-    const quotes = await res.json();
-    if (!Array.isArray(quotes)) throw new Error('Bad response');
-    renderStocks(quotes);
-  } catch (err) {
-    console.warn('Stocks error:', err.message);
-    document.getElementById('stocks-grid').innerHTML =
-      Object.values(STOCK_META).map(s =>
-        `<div class="stock-card">
-          <div class="stock-name">${s.label}</div>
-          <div class="stock-price" style="color:var(--muted);font-size:12px">Unavailable</div>
-        </div>`
-      ).join('');
-  }
-}
-
-function renderStocks(quotes) {
-  const bySymbol = {};
-  quotes.forEach(q => { bySymbol[q.symbol] = q; });
-
-  document.getElementById('stocks-grid').innerHTML =
-    Object.entries(STOCK_META).map(([sym, meta]) => {
-      const q = bySymbol[sym];
-      if (!q) return `<div class="stock-card"><div class="stock-name">${meta.label}</div><div class="stock-price" style="color:var(--muted)">—</div></div>`;
-      const up  = q.regularMarketChange >= 0;
-      return `<div class="stock-card">
-        <div class="stock-name">${meta.label}</div>
-        <div class="stock-price">${fmtPrice(q.regularMarketPrice)}</div>
-        <div class="stock-change ${up ? 'up' : 'down'}">${up ? '▲' : '▼'} ${Math.abs(q.regularMarketChangePercent).toFixed(2)}%</div>
-      </div>`;
-    }).join('');
-}
-
-function fmtPrice(p) {
-  if (p == null) return '—';
-  return p >= 1000 ? Math.round(p).toLocaleString() : p.toFixed(2);
-}
-
-// ═══════════════════════════════════════════════════════════════
-// WEATHER — fetched from Railway which proxies BOM JSON feeds
-// ═══════════════════════════════════════════════════════════════
-async function fetchWeather() {
-  try {
-    const res  = await fetch(`${API_BASE}/api/weather`);
-    const data = await res.json();
-    renderWeatherCards(data);
-    document.getElementById('weather-updated').textContent =
-      'BOM · ' + new Date().toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit' });
-  } catch (err) {
-    console.warn('Weather error:', err.message);
-    document.getElementById('weather-grid').innerHTML =
-      '<div style="font-family:var(--mono);font-size:11px;color:var(--red);padding:12px;grid-column:1/-1">⚠ Weather unavailable — deploy the updated server.js to Railway</div>';
-  }
-}
-
-function tempColor(t) {
-  if (t === null) return 'var(--muted)';
-  if (t >= 40) return '#c0392b';
-  if (t >= 35) return '#e74c3c';
-  if (t >= 30) return '#e67e22';
-  if (t >= 25) return '#f1c40f';
-  if (t >= 20) return '#27ae60';
-  if (t >= 15) return '#2980b9';
-  return '#8e44ad';
-}
-
-function renderWeatherCards(cities) {
-  document.getElementById('weather-grid').innerHTML = cities.map(c => {
-    const color  = tempColor(c.temp);
-    const temp   = c.temp  !== null ? `${c.temp}` : '—';
-    const feels  = c.feels !== null ? `${c.feels}°` : '—';
-    const humid  = c.humidity !== null ? `${c.humidity}%` : '—';
-    const maxT   = c.max  !== null && c.max  !== undefined ? `${c.max}°` : '—';
-    const minT   = c.min  !== null && c.min  !== undefined ? `${c.min}°` : '—';
-    const desc   = c.desc || '';
-    return `<div class="weather-card">
-      <div class="weather-city">${c.city}</div>
-      <div class="weather-temp" style="color:${color}">${temp}<span>°C</span></div>
-      ${desc ? `<div class="weather-desc">${desc}</div>` : ''}
-      <div class="weather-row">
-        <span class="weather-minmax"><span class="weather-max">↑${maxT}</span> <span class="weather-min">↓${minT}</span></span>
-      </div>
-      <div class="weather-row">
-        <span class="weather-stat">Feels <b>${feels}</b></span>
-        <span class="weather-stat">Hum <b>${humid}</b></span>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-// ═══════════════════════════════════════════════════════════════
-// NEWS
-// ═══════════════════════════════════════════════════════════════
-async function fetchCategories() {
-  try {
-    const res = await fetch(`${API_BASE}/api/categories`);
-    return await res.json();
-  } catch { return Object.keys(CATEGORY_META); }
-}
-
-async function fetchCategory(cat) {
-  const res = await fetch(`${API_BASE}/api/news/${cat}`);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return (await res.json()).articles;
-}
-
-async function fetchAllData() {
-  setRefreshing(true);
-  const results = await Promise.allSettled(
-    visibleCategories.map(async cat => [cat, await fetchCategory(cat)])
-  );
-  results.forEach(r => {
-    if (r.status === 'fulfilled') {
-      const [cat, articles] = r.value;
-      articleData[cat] = { articles, error: null };
-    }
-  });
-  renderColumns();
-  setRefreshing(false);
-  document.getElementById('last-updated').textContent =
-    'Updated ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-async function refreshAll() {
-  fetchStocks();
-  fetchWeather();
-  await fetchAllData();
-}
-
-// ─── Render ─────────────────────────────────────────────────────
-function renderNav() {
-  document.getElementById('category-nav').innerHTML = allCategories.map(cat => {
-    const meta   = CATEGORY_META[cat] || { label: cat, color: 'var(--muted)' };
-    const active = visibleCategories.includes(cat);
-    return `<button class="nav-item ${active ? 'active' : ''}" style="--cat-color:${meta.color}" onclick="toggleCategory('${cat}')">
-      <span class="dot"></span>${meta.label}
-    </button>`;
-  }).join('');
-}
-
-function renderColumns() {
-  document.getElementById('grid').innerHTML = visibleCategories.map((cat, i) => {
-    const meta  = CATEGORY_META[cat] || { label: cat, color: 'var(--muted)' };
-    const state = articleData[cat];
-    let content;
-    if (!state)            content = renderSkeletons(6);
-    else if (state.error)  content = `<div class="error-card">⚠ Could not load stories.<br><br>Make sure your Railway backend is running and this URL is reachable:<br><a href="${API_BASE}/api/news/${cat}" target="_blank" style="color:var(--accent)">${API_BASE}/api/news/${cat}</a></div>`;
-    else if (!state.articles.length) content = `<div class="empty">No articles found.</div>`;
-    else content = state.articles.map(renderArticle).join('');
-    const count = state?.articles?.length ?? '…';
-    return `<section class="column" style="--cat-color:${meta.color};animation-delay:${i*0.05}s">
-      <div class="column-header">
-        <div class="column-title">${meta.label}</div>
-        <div class="article-count">${count} stories</div>
-      </div>
-      ${content}
-    </section>`;
-  }).join('');
-}
-
-function renderArticle(a) {
-  const safe = s => (s || '').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  const time = a.published ? formatTime(new Date(a.published)) : '';
-  const imgHtml = a.image
-    ? `<img class="article-img" src="${a.image}" alt="" loading="lazy" onerror="this.style.display='none'">`
-    : `<div class="article-img-placeholder"></div>`;
-
-  return `<a class="article" href="${safe(a.link)}" target="_blank" rel="noopener">
-    <div class="article-inner">
-      ${imgHtml}
-      <div class="article-body">
-        <div class="article-meta">
-          <span class="source-tag">${safe(a.source)}</span>
-          ${time ? `<span class="article-time">${time}</span>` : ''}
-        </div>
-        <div class="article-title">${safe(a.title)}</div>
-        ${a.summary ? `<div class="article-summary">${safe(a.summary.slice(0,160))}</div>` : ''}
-      </div>
-    </div>
-  </a>`;
-}
-
-function renderSkeletons(n) {
-  return Array.from({length: n}, (_, i) => `
-    <div class="article skeleton" style="animation-delay:${i*0.07}s">
-      <div class="article-inner">
-        <div class="skel-img"></div>
-        <div style="flex:1">
-          <div class="skel-meta"><div class="skel-tag"></div><div class="skel-time"></div></div>
-          <div class="skel-line wide"></div><div class="skel-line med"></div>
-        </div>
-      </div>
-    </div>`).join('');
-}
-
-// ─── Interactions ────────────────────────────────────────────────
-function toggleCategory(cat) {
-  if (visibleCategories.includes(cat)) {
-    if (visibleCategories.length === 1) return;
-    visibleCategories = visibleCategories.filter(c => c !== cat);
-  } else {
-    visibleCategories.push(cat);
-    fetch(`${API_BASE}/api/news/${cat}`)
-      .then(r => r.json())
-      .then(d => { articleData[cat] = { articles: d.articles, error: null }; renderColumns(); })
-      .catch(() => { articleData[cat] = { articles: [], error: true }; renderColumns(); });
-  }
-  renderNav();
-  renderColumns();
-}
-
-function setRefreshing(on) {
-  const btn = document.getElementById('refresh-btn');
-  btn.classList.toggle('spinning', on);
-  btn.textContent = on ? '↻ Loading…' : '↻ Refresh';
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────
-function formatTime(date) {
-  const s = (Date.now() - date) / 1000;
-  if (isNaN(s) || s < 0) return '';
-  if (s < 60)    return 'just now';
-  if (s < 3600)  return Math.floor(s / 60) + 'm ago';
-  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-  // For older stories show actual date
-  return date.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' });
-}
-
-function updateDateline() {
-  document.getElementById('dateline').textContent =
-    new Date().toLocaleDateString('en-AU', {
-      weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
-    }).toUpperCase();
-}
-</script>
-</body>
-</html>
+// ---------------------------------------------------------------------------
+app.listen(PORT, () => {
+  console.log(`\n📰  News Dashboard Backend  →  http://localhost:${PORT}`);
+  console.log(`    Scraped : ${Object.keys(SCRAPERS).join(', ')}`);
+  console.log(`    RSS     : ${Object.keys(RSS_FEEDS).join(', ')}`);
+  console.log(`    Weather : /api/weather  (BOM official stations)`);
+  console.log(`    Stocks  : /api/stocks   (Yahoo Finance proxy)\n`);
+  console.log('    Tip: GET /api/debug/:category to force-refresh & inspect any feed\n');
+});
