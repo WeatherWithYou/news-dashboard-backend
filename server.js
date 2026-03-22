@@ -162,57 +162,49 @@ async function scrapeABC() {
 // ---------------------------------------------------------------------------
 // Reuters
 // ---------------------------------------------------------------------------
-async function scrapeReuters() {
+async function scrapeBBC() {
   const articles = [];
 
-  // Strategy 1: Reuters Wire API (used by their mobile app — RSS died March 2026)
+  // Strategy 1: BBC News RSS — most reliable, includes images via media:thumbnail
   try {
-    const data = await getJSON(
-      'https://wireapi.reuters.com/v8/feed/rapp/us/tabbar/feeds/home/topnews',
-      { headers: { Referer: 'https://www.reuters.com/', Accept: 'application/json' } }
-    );
-    const items = Array.isArray(data) ? data : (data?.articles || data?.items || []);
-    items.slice(0, 15).forEach(item => {
-      const image = item?.thumbnail_resizer_url || item?.image?.url || item?.images?.[0]?.url || null;
-      const a = makeArticle(
-        item.headline || item.title,
-        item.url || item.canonical_url,
-        'Reuters',
-        item.summary || item.body_short || '',
-        item.updated_at || item.published_at || null,
-        image
-      );
+    const rssP = new Parser({
+      timeout: 10000,
+      headers: { 'User-Agent': UA[0] },
+      customFields: { item: [['media:thumbnail','media:thumbnail',{keepArray:false}],['media:content','media:content',{keepArray:false}]] },
+    });
+    const feed = await rssP.parseURL('https://feeds.bbci.co.uk/news/rss.xml');
+    feed.items.slice(0, 20).forEach(item => {
+      const img = item['media:thumbnail']?.$.url || item['media:content']?.$.url || null;
+      const a = makeArticle(item.title, item.link, 'BBC News', item.contentSnippet || '', item.pubDate, img);
       if (a) articles.push(a);
     });
   } catch (_) {}
 
-  // Strategy 2: Google News RSS for reuters.com (always reliable)
+  // Strategy 2: BBC Top Stories RSS
   if (articles.length < 5) {
     try {
       const rssP = new Parser({ timeout: 10000, headers: { 'User-Agent': UA[0] } });
-      const feed = await rssP.parseURL('https://news.google.com/rss/search?q=when:12h+allinurl:reuters.com&ceid=AU:en&hl=en-AU&gl=AU');
+      const feed = await rssP.parseURL('https://feeds.bbci.co.uk/news/world/rss.xml');
       feed.items.slice(0, 15).forEach(item => {
-        const a = makeArticle(item.title, item.link, 'Reuters', item.contentSnippet || '', item.pubDate, null);
+        const a = makeArticle(item.title, item.link, 'BBC News', item.contentSnippet || '', item.pubDate, null);
         if (a) articles.push(a);
       });
     } catch (_) {}
   }
 
-  // Strategy 3: Reuters Arc Publishing API
+  // Strategy 3: Scrape BBC News front page
   if (articles.length < 5) {
     try {
-      const data = await getJSON(
-        'https://www.reuters.com/pf/api/v3/content/fetch/articles-by-section-alias-or-id-v1?query=%7B%22section_id%22%3A%22%2F%22%2C%22size%22%3A20%7D&d=152&_website=reuters',
-        { headers: { Referer: 'https://www.reuters.com/' } }
-      );
-      (data?.result?.articles || []).forEach(item => {
-        const image = item?.thumbnail?.renditions?.original?.url || null;
-        const a = makeArticle(
-          item.title || item.headline,
-          item.canonical_url ? `https://www.reuters.com${item.canonical_url}` : item.url,
-          'Reuters', item.description || '', item.published_time || null, image
-        );
-        if (a) articles.push(a);
+      const html = await getHTML('https://www.bbc.com/news');
+      const $    = cheerio.load(html);
+      $('a[href]').each((_, el) => {
+        const href  = $(el).attr('href') || '';
+        const title = $(el).text().trim();
+        if (title.length > 20 && /\/news\/articles\/|bbc\.co\.uk\/news\/[a-z]/.test(href)) {
+          const full = href.startsWith('http') ? href : `https://www.bbc.com${href}`;
+          const a = makeArticle(title, full, 'BBC News');
+          if (a) articles.push(a);
+        }
       });
     } catch (_) {}
   }
@@ -465,7 +457,7 @@ async function fetchRSSCategory(cat) {
 // ---------------------------------------------------------------------------
 // Dispatch + cache
 // ---------------------------------------------------------------------------
-const SCRAPERS = { abc: scrapeABC, reuters: scrapeReuters, aljazeera: scrapeAlJazeera, nzherald: scrapeNZHerald, afr: scrapeAFR };
+const SCRAPERS = { abc: scrapeABC, bbc: scrapeBBC, aljazeera: scrapeAlJazeera, nzherald: scrapeNZHerald, afr: scrapeAFR };
 const ALL_CATEGORIES = [...Object.keys(SCRAPERS), ...Object.keys(RSS_FEEDS)];
 
 const cache = {};
@@ -591,12 +583,28 @@ app.get('/api/weather', async (req, res) => {
 // Stock market data — Yahoo Finance v8 with Stooq CSV fallback
 // ---------------------------------------------------------------------------
 const STOCK_SYMBOLS = {
-  '^DJI':  { label: 'Dow Jones',  stooq: '%5EDJI'  },
-  '^AXJO': { label: 'ASX 200',    stooq: '%5EAXJO' },
-  '^NZ50': { label: 'NZX 50',     stooq: '%5ENZ50' },
-  '^HSI':  { label: 'Hang Seng',  stooq: '%5EHSI'  },
-  '^FTSE': { label: 'FTSE 100',   stooq: '%5EFTSE' },
-  '^IXIC': { label: 'NASDAQ',     stooq: '%5EIXIC' },
+  '^AXJO': { label: 'ASX 200',      stooq: '%5EAXJO' },
+  '^NZ50': { label: 'NZX 50',       stooq: '%5ENZ50' },
+  '^DJI':  { label: 'Dow Jones',    stooq: '%5EDJI'  },
+  '^FTSE': { label: 'FTSE 100',     stooq: '%5EFTSE' },
+  '^HSI':  { label: 'Hang Seng',    stooq: '%5EHSI'  },
+  '^STOXX50E': { label: 'Euro Stoxx 50', stooq: '%5ESTOXX50E' },
+  '000001.SS': { label: 'Shanghai',     stooq: '000001.ss' },
+  '^N225':    { label: 'Nikkei 225',    stooq: '%5EN225' },
+};
+
+// Commodity tickers for the second ticker bar
+const COMMODITY_SYMBOLS = {
+  'GC=F':  { label: 'Gold',          unit: 'USD/oz'  },
+  'SI=F':  { label: 'Silver',        unit: 'USD/oz'  },
+  'CL=F':  { label: 'Crude Oil',     unit: 'USD/bbl' },
+  'NG=F':  { label: 'Natural Gas',   unit: 'USD/MMBtu'},
+  'HG=F':  { label: 'Copper',        unit: 'USD/lb'  },
+  'PL=F':  { label: 'Platinum',      unit: 'USD/oz'  },
+  'PA=F':  { label: 'Palladium',     unit: 'USD/oz'  },
+  'ZW=F':  { label: 'Wheat',         unit: 'USc/bu'  },
+  'ZC=F':  { label: 'Corn',          unit: 'USc/bu'  },
+  'BTC-USD': { label: 'Bitcoin',     unit: 'USD'     },
 };
 
 const stockCache = { data: null, ts: 0 };
@@ -692,6 +700,32 @@ app.get('/api/stocks', async (req, res) => {
 
   stockCache.data = quotes;
   stockCache.ts   = now;
+  res.json(quotes);
+});
+
+// ---------------------------------------------------------------------------
+// News routes
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Commodities proxy
+// ---------------------------------------------------------------------------
+const commodityCache = { data: null, ts: 0 };
+const COMMODITY_TTL  = 5 * 60 * 1000;
+
+app.get('/api/commodities', async (req, res) => {
+  const now = Date.now();
+  if (commodityCache.data && now - commodityCache.ts < COMMODITY_TTL) return res.json(commodityCache.data);
+  const symbols = Object.keys(COMMODITY_SYMBOLS);
+  let quotes = [];
+  try {
+    quotes = await fetchYahoo(symbols);
+    console.log(`  Commodities: Yahoo returned ${quotes.length} quotes`);
+  } catch (err) {
+    console.warn(`  Commodities Yahoo fail: ${err.message}`);
+  }
+  if (quotes.length === 0) return res.status(502).json({ error: 'Commodities fetch failed' });
+  commodityCache.data = quotes;
+  commodityCache.ts   = now;
   res.json(quotes);
 });
 
