@@ -1,4 +1,4 @@
-const express  = require('express');
+'const express  = require('express');
 const cors     = require('cors');
 const cheerio  = require('cheerio');
 const Parser   = require('rss-parser');
@@ -730,19 +730,90 @@ app.get('/api/stocks', async (req, res) => {
 const commodityCache = { data: null, ts: 0 };
 const COMMODITY_TTL  = 5 * 60 * 1000;
 
+// Fetch a single symbol from Stooq CSV — works for futures like GC.F, CL.F
+async function fetchStooqSymbol(yahooSym) {
+  // Convert Yahoo futures format (GC=F) to Stooq format (GC.F)
+  const stooqSym = yahooSym
+    .replace('=F', '.f')
+    .replace('-USD', 'usd')
+    .toLowerCase();
+  const url = `https://stooq.com/q/l/?s=${stooqSym}&f=sd2t2ohlcv&h&e=csv`;
+  const r = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(6000),
+  });
+  const text = await r.text();
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) throw new Error('No data');
+  const cols  = lines[1].split(',');
+  const close = parseFloat(cols[4]);
+  const open  = parseFloat(cols[2]);
+  if (isNaN(close) || close === 0) throw new Error('Invalid price');
+  const change    = close - open;
+  const changePct = open !== 0 ? (change / open) * 100 : 0;
+  return { symbol: yahooSym, regularMarketPrice: close, regularMarketChange: change, regularMarketChangePercent: changePct };
+}
+
 app.get('/api/commodities', async (req, res) => {
   const now = Date.now();
   if (commodityCache.data && now - commodityCache.ts < COMMODITY_TTL) return res.json(commodityCache.data);
+
   const symbols = Object.keys(COMMODITY_SYMBOLS);
   let quotes = [];
-  // Always use v7 for commodities — v8 spark does not support futures symbols
+
+  // --- Source 1: Yahoo Finance v7 quote API ---
   try {
     quotes = await fetchYahooV7(symbols);
-    console.log(`  Commodities: v7 returned ${quotes.length} quotes`);
+    console.log(`  Commodities v7: ${quotes.length}/${symbols.length} quotes`);
   } catch (err) {
     console.warn(`  Commodities v7 fail: ${err.message}`);
   }
-  if (quotes.length === 0) return res.status(502).json({ error: 'Commodities fetch failed' });
+
+  // --- Source 2: Yahoo Finance v8 spark (different rate limit bucket) ---
+  if (quotes.length < symbols.length / 2) {
+    try {
+      const have = new Set(quotes.map(q => q.symbol));
+      const missing = symbols.filter(s => !have.has(s));
+      // v8 spark works for some commodity ETF proxies even if not all futures
+      const url = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(missing.join(','))}&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent`;
+      const r   = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)', 'Accept': 'application/json', 'Referer': 'https://finance.yahoo.com/' },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (r.ok) {
+        const data = await r.json();
+        const extra = (data?.quoteResponse?.result || []).filter(q => q.regularMarketPrice);
+        quotes = [...quotes, ...extra];
+        console.log(`  Commodities query2: +${extra.length} quotes`);
+      }
+    } catch (err) {
+      console.warn(`  Commodities query2 fail: ${err.message}`);
+    }
+  }
+
+  // --- Source 3: Stooq CSV fallback per symbol ---
+  if (quotes.length < symbols.length / 2) {
+    console.log('  Commodities: falling back to Stooq CSV...');
+    const have = new Set(quotes.map(q => q.symbol));
+    const missing = symbols.filter(s => !have.has(s));
+    const stooqResults = await Promise.allSettled(missing.map(fetchStooqSymbol));
+    stooqResults.forEach((r, i) => {
+      if (r.status === 'fulfilled') {
+        quotes.push(r.value);
+        console.log(`    ✓ Stooq ${missing[i]}: ${r.value.regularMarketPrice}`);
+      } else {
+        console.warn(`    ✗ Stooq ${missing[i]}: ${r.reason?.message}`);
+      }
+    });
+  }
+
+  // --- Always return what we have, even if partial ---
+  if (quotes.length === 0) {
+    console.error('  Commodities: all sources failed');
+    return res.status(502).json({ error: 'Commodities fetch failed — check Railway logs' });
+  }
+
+  console.log(`  Commodities: serving ${quotes.length} quotes`);
   commodityCache.data = quotes;
   commodityCache.ts   = now;
   res.json(quotes);
