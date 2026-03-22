@@ -583,62 +583,80 @@ app.get('/api/weather', async (req, res) => {
 // Stock market data — Yahoo Finance v8 with Stooq CSV fallback
 // ---------------------------------------------------------------------------
 const STOCK_SYMBOLS = {
-  '^AXJO': { label: 'ASX 200',      stooq: '%5EAXJO' },
-  '^NZ50': { label: 'NZX 50',       stooq: '%5ENZ50' },
-  '^DJI':  { label: 'Dow Jones',    stooq: '%5EDJI'  },
-  '^FTSE': { label: 'FTSE 100',     stooq: '%5EFTSE' },
-  '^HSI':  { label: 'Hang Seng',    stooq: '%5EHSI'  },
+  '^AXJO':     { label: 'ASX 200',       stooq: '%5EAXJO'     },
+  '^NZ50':     { label: 'NZX 50',        stooq: '%5ENZ50'     },
+  '^DJI':      { label: 'Dow Jones',     stooq: '%5EDJI'      },
+  '^FTSE':     { label: 'FTSE 100',      stooq: '%5EFTSE'     },
+  '^HSI':      { label: 'Hang Seng',     stooq: '%5EHSI'      },
   '^STOXX50E': { label: 'Euro Stoxx 50', stooq: '%5ESTOXX50E' },
-  '000001.SS': { label: 'Shanghai',     stooq: '000001.ss' },
-  '^N225':    { label: 'Nikkei 225',    stooq: '%5EN225' },
+  '000001.SS': { label: 'Shanghai',      stooq: '000001.ss'   },
+  '^N225':     { label: 'Nikkei 225',    stooq: '%5EN225'     },
 };
 
-// Commodity tickers for the second ticker bar
+// Commodity & precious metal futures — Yahoo Finance symbols
+// Note: these MUST use v7 quote API (v8 spark doesn't support futures)
 const COMMODITY_SYMBOLS = {
-  'GC=F':  { label: 'Gold',          unit: 'USD/oz'  },
-  'SI=F':  { label: 'Silver',        unit: 'USD/oz'  },
-  'CL=F':  { label: 'Crude Oil',     unit: 'USD/bbl' },
-  'NG=F':  { label: 'Natural Gas',   unit: 'USD/MMBtu'},
-  'HG=F':  { label: 'Copper',        unit: 'USD/lb'  },
-  'PL=F':  { label: 'Platinum',      unit: 'USD/oz'  },
-  'PA=F':  { label: 'Palladium',     unit: 'USD/oz'  },
-  'ZW=F':  { label: 'Wheat',         unit: 'USc/bu'  },
-  'ZC=F':  { label: 'Corn',          unit: 'USc/bu'  },
-  'BTC-USD': { label: 'Bitcoin',     unit: 'USD'     },
+  'GC=F':    { label: 'Gold',        unit: 'oz'    },
+  'SI=F':    { label: 'Silver',      unit: 'oz'    },
+  'CL=F':    { label: 'Crude Oil',   unit: 'bbl'   },
+  'NG=F':    { label: 'Nat. Gas',    unit: 'MMBtu' },
+  'HG=F':    { label: 'Copper',      unit: 'lb'    },
+  'PL=F':    { label: 'Platinum',    unit: 'oz'    },
+  'PA=F':    { label: 'Palladium',   unit: 'oz'    },
+  'ZW=F':    { label: 'Wheat',       unit: 'bu'    },
+  'ZC=F':    { label: 'Corn',        unit: 'bu'    },
+  'BTC-USD': { label: 'Bitcoin',     unit: 'USD'   },
 };
 
 const stockCache = { data: null, ts: 0 };
 const STOCK_TTL  = 5 * 60 * 1000;
 
+// v7 quote API — works for both indices AND futures/commodities
+async function fetchYahooV7(symbols) {
+  const fields = 'regularMarketPrice,regularMarketChange,regularMarketChangePercent,regularMarketPreviousClose';
+  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols.join(','))}&fields=${fields}`;
+  const r = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': 'application/json',
+      'Referer': 'https://finance.yahoo.com/',
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!r.ok) throw new Error(`Yahoo v7 HTTP ${r.status}`);
+  const data = await r.json();
+  return (data?.quoteResponse?.result || []).filter(q => q.regularMarketPrice);
+}
+
+// v8 spark API — better for indices (has prev close in meta)
 async function fetchYahoo(symbols) {
+  // Try v7 first as it supports all symbol types including futures
+  try {
+    return await fetchYahooV7(symbols);
+  } catch (err) {
+    console.warn(`  Yahoo v7 fail: ${err.message}, trying v8 spark`);
+  }
+  // v8 spark fallback
   const url = `https://query2.finance.yahoo.com/v8/finance/spark?symbols=${encodeURIComponent(symbols.join(','))}&range=1d&interval=5m`;
   const r   = await fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Accept': 'application/json',
       'Referer': 'https://finance.yahoo.com/',
-      'Origin':  'https://finance.yahoo.com',
     },
     signal: AbortSignal.timeout(10000),
   });
-  if (!r.ok) throw new Error(`Yahoo HTTP ${r.status}`);
+  if (!r.ok) throw new Error(`Yahoo v8 HTTP ${r.status}`);
   const data = await r.json();
-
-  // v8 spark returns: { spark: { result: [ { symbol, response: [{ meta }] } ] } }
   const results = data?.spark?.result || [];
   return results.map(item => {
-    const meta   = item?.response?.[0]?.meta || {};
+    const meta = item?.response?.[0]?.meta || {};
     const prices = item?.response?.[0]?.indicators?.quote?.[0]?.close || [];
-    const prev   = meta.chartPreviousClose || meta.previousClose || null;
-    const curr   = meta.regularMarketPrice || (prices.length ? prices[prices.length - 1] : null);
+    const prev = meta.chartPreviousClose || meta.previousClose || null;
+    const curr = meta.regularMarketPrice || (prices.length ? prices[prices.length - 1] : null);
     const change = (curr && prev) ? curr - prev : null;
     const changePct = (change && prev) ? (change / prev) * 100 : null;
-    return {
-      symbol: item.symbol,
-      regularMarketPrice: curr,
-      regularMarketChange: change,
-      regularMarketChangePercent: changePct,
-    };
+    return { symbol: item.symbol, regularMarketPrice: curr, regularMarketChange: change, regularMarketChangePercent: changePct };
   }).filter(q => q.regularMarketPrice);
 }
 
@@ -717,11 +735,12 @@ app.get('/api/commodities', async (req, res) => {
   if (commodityCache.data && now - commodityCache.ts < COMMODITY_TTL) return res.json(commodityCache.data);
   const symbols = Object.keys(COMMODITY_SYMBOLS);
   let quotes = [];
+  // Always use v7 for commodities — v8 spark does not support futures symbols
   try {
-    quotes = await fetchYahoo(symbols);
-    console.log(`  Commodities: Yahoo returned ${quotes.length} quotes`);
+    quotes = await fetchYahooV7(symbols);
+    console.log(`  Commodities: v7 returned ${quotes.length} quotes`);
   } catch (err) {
-    console.warn(`  Commodities Yahoo fail: ${err.message}`);
+    console.warn(`  Commodities v7 fail: ${err.message}`);
   }
   if (quotes.length === 0) return res.status(502).json({ error: 'Commodities fetch failed' });
   commodityCache.data = quotes;
@@ -752,10 +771,63 @@ app.get('/api/debug/:category', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Background scheduler — keeps all caches warm so every page load is instant
+// ---------------------------------------------------------------------------
+const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function refreshAll() {
+  console.log(`\n🔄  Background refresh started — ${new Date().toLocaleTimeString()}`);
+
+  // Refresh all news categories (stagger them 3s apart to avoid hammering sources)
+  for (const category of ALL_CATEGORIES) {
+    try {
+      delete cache[category]; // force re-fetch
+      await getArticles(category);
+      console.log(`    ✓ ${category}`);
+    } catch (err) {
+      console.warn(`    ✗ ${category}: ${err.message}`);
+    }
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  // Refresh weather and stocks in parallel after news
+  await Promise.allSettled([
+    (async () => {
+      try {
+        weatherCache.ts = 0; // force re-fetch
+        const res = await fetch(`http://localhost:${PORT}/api/weather`);
+        if (res.ok) console.log(`    ✓ weather`);
+      } catch (err) { console.warn(`    ✗ weather: ${err.message}`); }
+    })(),
+    (async () => {
+      try {
+        stockCache.ts = 0;
+        const res = await fetch(`http://localhost:${PORT}/api/stocks`);
+        if (res.ok) console.log(`    ✓ stocks`);
+      } catch (err) { console.warn(`    ✗ stocks: ${err.message}`); }
+    })(),
+    (async () => {
+      try {
+        commodityCache.ts = 0;
+        const res = await fetch(`http://localhost:${PORT}/api/commodities`);
+        if (res.ok) console.log(`    ✓ commodities`);
+      } catch (err) { console.warn(`    ✗ commodities: ${err.message}`); }
+    })(),
+  ]);
+
+  console.log(`    Done — next refresh in ${REFRESH_INTERVAL_MS / 60000} min\n`);
+}
+
 app.listen(PORT, () => {
   console.log(`\n📰  News Dashboard  →  http://localhost:${PORT}`);
   console.log(`    Scraped : ${Object.keys(SCRAPERS).join(', ')}`);
   console.log(`    RSS     : ${Object.keys(RSS_FEEDS).join(', ')}`);
   console.log(`    Weather : /api/weather`);
-  console.log(`    Stocks  : /api/stocks\n`);
+  console.log(`    Stocks  : /api/stocks`);
+  console.log(`    Auto-refresh every ${REFRESH_INTERVAL_MS / 60000} minutes\n`);
+
+  // Do an initial warm-up fetch on startup, then schedule recurring refreshes
+  setTimeout(refreshAll, 5000); // wait 5s for server to be fully ready
+  setInterval(refreshAll, REFRESH_INTERVAL_MS);
 });
